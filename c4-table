@@ -4,6 +4,7 @@ import json
 import argparse
 import itertools
 import requests
+import concurrent.futures
 from urllib.parse import urlparse
 from argparse import RawTextHelpFormatter
 from collections import defaultdict
@@ -13,16 +14,15 @@ from collections import defaultdict
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate markdown table of submissions from Code4rena API for a slug and username",
-        epilog="Example: c4-table 2024-02-hydradx carrotsmuggler\n"
+        epilog="Example: c4-table 2025-06-chainlink-rewards random1106\n"
         "Requires C4AUTH_LOGIN cookie in the environment",
         formatter_class=RawTextHelpFormatter,
     )
     parser.add_argument(
-        "repo_link",
-        help="Link to the repo. Accepts one of the following:\n"
-        " 1. http link to the findings repo\n"
-        " 2. Name of the contest repo\n"
-        " 3. Name of the findings repo",
+        "contest_ref",
+        help="Contest reference. Accepts one of the following:\n"
+        " 1. Code4rena contest URL (e.g., https://code4rena.com/audits/2025-06-chainlink-rewards)\n"
+        " 2. Contest slug (e.g., 2025-06-chainlink-rewards)",
     )
     parser.add_argument(
         "username",
@@ -35,18 +35,12 @@ def parse_arguments():
         "-v", "--verbose", help="increase output verbosity", action="store_true"
     )
     parser.add_argument(
-        "-l",
-        "--links-only",
-        help="Only lists html links, very fast",
-        action="store_true",
-    )
-    parser.add_argument(
         "-u", "--user-stats", help="List all user stats", action="store_true"
     )
     parser.add_argument(
         "-p",
-        "--primary-issues",
-        help="List all primary/selected for report issues",
+        "--primary",
+        help="List all primary/selected submissions",
         action="store_true",
     )
     return parser.parse_args()
@@ -71,25 +65,43 @@ def _fetch_submissions(slug):
         "content-type": "application/json",
         "cookie": f"C4AUTH-LOGIN={cookie}",
     }
-    submissions = []
-    page = 1
-    last_page = 1
-    while page <= last_page:
+    def fetch_page(session, page):
         url = f"https://code4rena.com/api/v1/audits/{slug}/submissions?perPage=100&page={page}"
-        resp = requests.get(url, headers=headers)
+        resp = session.get(url, headers=headers)
         if resp.status_code != 200:
             try:
                 body = resp.json()
             except Exception:
                 body = resp.text
-            print(f"Error fetching submissions (HTTP {resp.status_code}) page {page}:\n{body}")
-            exit(1)
+            raise RuntimeError(f"HTTP {resp.status_code} page {page}: {body}")
         data = resp.json()
         subs = data.get("data", {}).get("submissions", data.get("data", []))
-        if isinstance(subs, list):
-            submissions.extend(subs)
-        last_page = data.get("pagination", {}).get("lastPage", last_page)
-        page += 1
+        if not isinstance(subs, list):
+            subs = []
+        pagination = data.get("pagination", {})
+        return subs, pagination
+
+    submissions = []
+    with requests.Session() as session:
+        try:
+            subs, pagination = fetch_page(session, 1)
+        except Exception as e:
+            print(f"Error fetching submissions: {e}")
+            exit(1)
+        submissions.extend(subs)
+        last_page = pagination.get("lastPage", 1) or 1
+        if last_page > 1:
+            pages = list(range(2, last_page + 1))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(pages))) as ex:
+                futures = {ex.submit(fetch_page, session, p): p for p in pages}
+                for fut in concurrent.futures.as_completed(futures):
+                    p = futures[fut]
+                    try:
+                        subs, _ = fut.result()
+                        submissions.extend(subs)
+                    except Exception as e:
+                        print(f"Error fetching page {p}: {e}")
+                        exit(1)
     return submissions
 
 def fetch_list(owner, repo_or_slug):
@@ -122,7 +134,7 @@ def print_table(
     dupes=[],
     severities=[],
     username="",
-    repo="",
+    contest="",
 ):
     # Calculate maximum lengths
     number = max(
@@ -169,7 +181,7 @@ def print_table(
     print("\n".join(combined_table))
 
     if number > 0:
-        print(f"\nFound {number} issues from {username} in {repo} repo\n")
+        print(f"\nFound {number} submissions from {username} in {contest}\n")
     print(
         "Severity Legend: H - High Risk, M - Medium Risk, QA - Quality Assurance, A - Analysis, G - Gas Optimization"
     )
@@ -178,9 +190,9 @@ def print_table(
     )
 
 
-# %% Fetch list and issue numbers from Code4rena API
+# %% Fetch list and submission numbers from Code4rena API
 # Parse input and derive slug
-http_url = args.repo_link
+http_url = args.contest_ref
 if http_url.startswith("http"):
     parsed_url = urlparse(http_url)
     parts = parsed_url.path.strip("/").split("/")
@@ -190,28 +202,12 @@ else:
     slug = http_url
 
 owner = "code4rena"
-repo = slug
 
 issuenum_by_user, issues_count = fetch_list(owner, slug)
 
 
-# %% Early exits
-def handle_links_only(issuenum_by_user, args, owner, repo):
-    username = args.username
-    if not username:
-        print("Username not provided")
-        return
-
-    issue_numbers = issuenum_by_user[username]
-    url_list = [
-        f"https://github.com/{owner}/{repo}/issues/{element}"
-        for element in issue_numbers
-    ]
-    print_table(numbers=issue_numbers, urls=url_list, username=username, repo=repo)
-
-
 def handle_user_stats(issuenum_by_user, issues_count):
-    print(f"{'Username':<20} | {'Number of issues'}")
+    print(f"{'Username':<20} | {'Number of submissions'}")
     print(f"{'-'*20} | {'-'*15}")
 
     sorted_issuenum_by_user = sorted(
@@ -221,13 +217,8 @@ def handle_user_stats(issuenum_by_user, issues_count):
     for username, issue_numbers in sorted_issuenum_by_user:
         print(f"{username:<20} | {len(issue_numbers)} ")
 
-    print(f"Total {issues_count} issues submitted by {len(issuenum_by_user)} users")
+    print(f"Total {issues_count} submissions submitted by {len(issuenum_by_user)} users")
 
-
-# Main early exit logic
-if args.links_only:
-    handle_links_only(issuenum_by_user, args, owner, repo)
-    quit()
 
 if args.user_stats:
     handle_user_stats(issuenum_by_user, issues_count)
@@ -300,7 +291,7 @@ for s in submissions:
 
 # %% Primary issues/ Report generation
 # Get all issues marked P (selected for report, or primary issues)
-if args.primary_issues:
+if args.primary:
     num_list = [element for element in primary_issues]
     url_list = [f"https://code4rena.com/contests/{slug}/submissions/{element}" for element in num_list]
     title_list = [issues_arr[element]["title"] for element in num_list]
@@ -311,11 +302,11 @@ if args.primary_issues:
         numbers=num_list,
         urls=url_list,
         titles=title_list,
-        username="Primary Issues",
+        username="Primary Submissions",
         dupes=dupes_list_user,
         status=acceptance_list,
         severities=severity_list,
-        repo=repo,
+        contest=slug,
     )
     quit()
 
@@ -339,5 +330,5 @@ print_table(
     dupes=dupes_list_user,
     status=acceptance_list,
     severities=severity_list,
-    repo=repo,
+    contest=slug,
 )
