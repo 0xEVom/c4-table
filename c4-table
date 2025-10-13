@@ -110,10 +110,22 @@ def fetch_list(owner, repo_or_slug):
     subs = _fetch_submissions(slug)
     issuenum_by_user = defaultdict(list)
     for s in subs:
-        handle = (s.get("user") or {}).get("handle")
+        # If a submission belongs to a team, index it ONLY under the team handle.
+        # Otherwise, index it under the individual user handle.
+        handles = []
+        team = s.get("team") or {}
+        team_handle = team.get("handle")
+        if team_handle:
+            handles = [team_handle]
+        else:
+            user_handle = (s.get("user") or {}).get("handle")
+            if user_handle:
+                handles = [user_handle]
         num = s.get("number")
-        if handle and isinstance(num, int):
-            issuenum_by_user[handle].append(num)
+        if isinstance(num, int):
+            for h in handles:
+                if num not in issuenum_by_user[h]:
+                    issuenum_by_user[h].append(num)
     for numbers in issuenum_by_user.values():
         numbers.sort()
     return issuenum_by_user, len(subs)
