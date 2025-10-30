@@ -195,10 +195,10 @@ def print_table(
     if number > 0:
         print(f"\nFound {number} submissions from {username} in {contest}\n")
     print(
-        "Severity Legend: H - High Risk, M - Medium Risk, QA - Quality Assurance, A - Analysis, G - Gas Optimization"
+        "Severity Legend: H - High Risk, M - Medium Risk, QA - Quality Assurance"
     )
     print(
-        "Status Legend: P - Primary, D{num} - Duplicate, X - Rejected, QA - Quality Assurance, A - Analysis"
+        "Status Legend: P - Primary, D{num} - Duplicate, X - Rejected"
     )
 
 
@@ -274,26 +274,35 @@ for s in submissions:
     issues_parent[num] = primary_num if primary_num is not None else num
 
     # Acceptance/status
-    status = None
-    if s.get("isPrimary"):
-        status = "P"
-    else:
-        # if invalid
-        validity = None
+    # Prioritize invalid over primary. If submission is invalid, mark as X even if isPrimary.
+    validity = (s.get("latestEvaluations") or {}).get("validity")
+    if validity is None:
         for ev in (s.get("evaluations") or []):
             if ev.get("type") == "validity":
                 validity = ev.get("value")
-        if validity == "invalid":
-            status = "X"
-        elif primary_num is not None:
-            status = f"D{primary_num}"
-        else:
-            status = "D"
+    status = None
+    vlower = validity.lower() if isinstance(validity, str) else ""
+    if vlower in ("invalid", "out of scope"):
+        status = "X"
+    elif s.get("isPrimary"):
+        status = "P"
+    elif primary_num is not None:
+        status = f"D{primary_num}"
+    else:
+        status = "D"
     acceptance[num] = status
 
-    # Severity
-    sev = s.get("severity") or ""
-    sev_code = "H" if sev.lower() == "high" else ("M" if sev.lower() == "medium" else "X")
+    # Severity: prefer latestEvaluations.severity; map 'low'/'qa' -> 'QA'
+    sev_raw = (s.get("latestEvaluations") or {}).get("severity") or s.get("severity") or ""
+    sev_lower = str(sev_raw).lower()
+    if sev_lower == "high":
+        sev_code = "H"
+    elif sev_lower == "medium":
+        sev_code = "M"
+    elif sev_lower in ("low", "qa"):
+        sev_code = "QA"
+    else:
+        sev_code = "X"
     severities[num] = sev_code
 
     if s.get("isPrimary"):
